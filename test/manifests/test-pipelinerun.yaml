@@ -1,0 +1,62 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: integration-test-
+  namespace: default
+  labels:
+    appstudio.openshift.io/application: test-app
+    appstudio.openshift.io/component: test-component
+    pipelines.appstudio.openshift.io/type: build
+  annotations:
+    build.appstudio.redhat.com/target_branch: "main"
+    build.appstudio.redhat.com/commit_sha: "abc123"
+spec:
+  pipelineSpec:
+    tasks:
+      - name: verify
+        taskSpec:
+          volumes:
+            - name: broker-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: konflux-oidc-broker
+                      expirationSeconds: 600
+                      path: token
+          steps:
+            - name: test
+              image: registry.access.redhat.com/ubi9-minimal:latest
+              volumeMounts:
+                - name: broker-token
+                  mountPath: /var/run/secrets/broker
+                  readOnly: true
+              script: |
+                #!/usr/bin/env bash
+                set +x
+                echo "=== Reading SA token ==="
+                SA_TOKEN=$(cat /var/run/secrets/broker/token)
+                echo "Token length: ${#SA_TOKEN}"
+
+                echo "=== Calling broker ==="
+                RESP=$(curl -s --retry 5 --retry-delay 3 --retry-all-errors \
+                  -X POST http://oidc-broker.oidc-broker.svc/v1/token \
+                  -H "Content-Type: application/json" \
+                  -d "{\"sa_token\": \"${SA_TOKEN}\"}")
+                echo "Response length: ${#RESP}"
+
+                if echo "${RESP}" | grep -q '"error"'; then
+                  echo "Broker error: ${RESP}"
+                  exit 1
+                fi
+
+                echo "=== Extracting sub from claims ==="
+                SUB=$(echo "${RESP}" | grep -o '"sub":"[^"]*"' | cut -d'"' -f4)
+                echo "Sub: ${SUB}"
+
+                echo "=== Assertions ==="
+                echo "${SUB}" | grep -q "v1:ns:default" && echo "PASS: namespace" || { echo "FAIL: namespace"; exit 1; }
+                echo "${SUB}" | grep -q "app:test-app" && echo "PASS: application" || { echo "FAIL: application"; exit 1; }
+                echo "${SUB}" | grep -q "component:test-component" && echo "PASS: component" || { echo "FAIL: component"; exit 1; }
+                echo "${SUB}" | grep -q "type:build" && echo "PASS: type" || { echo "FAIL: type"; exit 1; }
+                echo "${SUB}" | grep -q "ref:main" && echo "PASS: ref" || { echo "FAIL: ref"; exit 1; }
+                echo "All assertions passed"

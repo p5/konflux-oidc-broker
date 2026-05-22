@@ -1,0 +1,86 @@
+---
+apiVersion: tekton.dev/v1alpha1
+kind: StepAction
+metadata:
+  name: aws-oidc-auth
+spec:
+  description: |-
+    Exchanges an enriched OIDC token for temporary AWS credentials
+    via STS AssumeRoleWithWebIdentity. Must run after oidc-broker-auth.
+
+    The parent Task must declare two volumes:
+      - The enriched token volume (written by oidc-broker-auth)
+      - An emptyDir (medium: Memory) volume for AWS credentials
+  image: registry.access.redhat.com/ubi9-minimal:latest
+  params:
+    - name: roleArn
+      type: string
+      description: ARN of the IAM role to assume.
+    - name: region
+      type: string
+      default: us-east-1
+      description: AWS region for STS endpoint.
+    - name: sessionDuration
+      type: string
+      default: "900"
+      description: Duration in seconds for temporary credentials (900-43200).
+    - name: enrichedTokenVolume
+      type: string
+      default: enriched-token
+      description: Name of the volume containing the enriched JWT.
+    - name: awsCredentialsVolume
+      type: string
+      default: aws-credentials
+      description: Name of the emptyDir volume for writing credentials.
+  env:
+    - name: ROLE_ARN
+      value: "$(params.roleArn)"
+    - name: REGION
+      value: "$(params.region)"
+    - name: SESSION_DURATION
+      value: "$(params.sessionDuration)"
+  volumeMounts:
+    - name: $(params.enrichedTokenVolume)
+      mountPath: /var/run/secrets/enriched
+      readOnly: true
+    - name: $(params.awsCredentialsVolume)
+      mountPath: /var/run/secrets/aws
+  script: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set +x
+
+    TOKEN=$(cat /var/run/secrets/enriched/token)
+    CREDS_FILE="/var/run/secrets/aws/credentials"
+
+    RESPONSE=$(curl -s -X POST \
+      "https://sts.${REGION}.amazonaws.com/" \
+      --data-urlencode "Action=AssumeRoleWithWebIdentity" \
+      --data-urlencode "Version=2011-06-15" \
+      --data-urlencode "RoleArn=${ROLE_ARN}" \
+      --data-urlencode "RoleSessionName=konflux-${HOSTNAME}" \
+      --data-urlencode "WebIdentityToken=${TOKEN}" \
+      --data-urlencode "DurationSeconds=${SESSION_DURATION}")
+
+    ACCESS_KEY=$(echo "${RESPONSE}" | grep -oPm1 '(?<=<AccessKeyId>)[^<]+')
+    SECRET_KEY=$(echo "${RESPONSE}" | grep -oPm1 '(?<=<SecretAccessKey>)[^<]+')
+    SESSION_TOKEN=$(echo "${RESPONSE}" | grep -oPm1 '(?<=<SessionToken>)[^<]+')
+
+    if [ -z "${ACCESS_KEY}" ] || [ -z "${SECRET_KEY}" ] || [ -z "${SESSION_TOKEN}" ]; then
+      echo "ERROR: STS AssumeRoleWithWebIdentity failed." >&2
+      ERROR_MSG=$(echo "${RESPONSE}" | grep -oPm1 '(?<=<Message>)[^<]+' || true)
+      if [ -n "${ERROR_MSG}" ]; then
+        echo "AWS Error: ${ERROR_MSG}" >&2
+      fi
+      exit 1
+    fi
+
+    cat > "${CREDS_FILE}" <<CRED
+    [default]
+    aws_access_key_id=${ACCESS_KEY}
+    aws_secret_access_key=${SECRET_KEY}
+    aws_session_token=${SESSION_TOKEN}
+    CRED
+
+    chmod 0600 "${CREDS_FILE}"
+    echo "AWS credentials obtained."

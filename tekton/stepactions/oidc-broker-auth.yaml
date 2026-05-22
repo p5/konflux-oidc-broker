@@ -1,0 +1,63 @@
+---
+apiVersion: tekton.dev/v1alpha1
+kind: StepAction
+metadata:
+  name: oidc-broker-auth
+spec:
+  description: |-
+    Obtains an enriched OIDC token from the Konflux OIDC Broker.
+    Cloud-agnostic — writes the enriched JWT to a volume for use
+    by subsequent cloud-specific steps (AWS STS, GCP WIF, etc).
+
+    The parent Task must declare two volumes:
+      - A projected serviceAccountToken volume (audience: konflux-oidc-broker)
+      - An emptyDir (medium: Memory) volume for the enriched token
+  image: registry.access.redhat.com/ubi9-minimal:latest
+  params:
+    - name: audience
+      type: string
+      description: Audience claim for the enriched token (e.g. sts.amazonaws.com for AWS, GCP workload identity pool URL, api://AzureADTokenExchange for Azure, or a Vault address).
+    - name: brokerUrl
+      type: string
+      default: http://oidc-broker.oidc-broker.svc/v1
+      description: URL of the Konflux OIDC Broker service.
+    - name: brokerTokenVolume
+      type: string
+      default: broker-token
+      description: Name of the projected serviceAccountToken volume.
+    - name: enrichedTokenVolume
+      type: string
+      default: enriched-token
+      description: Name of the emptyDir volume for the enriched JWT.
+  env:
+    - name: AUDIENCE
+      value: "$(params.audience)"
+    - name: BROKER_URL
+      value: "$(params.brokerUrl)"
+  volumeMounts:
+    - name: $(params.brokerTokenVolume)
+      mountPath: /var/run/secrets/broker
+      readOnly: true
+    - name: $(params.enrichedTokenVolume)
+      mountPath: /var/run/secrets/enriched
+  script: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set +x
+
+    SA_TOKEN=$(cat /var/run/secrets/broker/token)
+
+    RESP=$(curl -s --retry 3 --retry-delay 2 --max-time 10 \
+      -X POST "${BROKER_URL}/token" \
+      -H "Content-Type: application/json" \
+      -d "{\"sa_token\": \"${SA_TOKEN}\", \"audience\": \"${AUDIENCE}\"}")
+
+    if echo "${RESP}" | grep -q '"error"'; then
+      echo "ERROR: Broker returned error" >&2
+      echo "${RESP}" | grep -o '"error":"[^"]*"' >&2
+      exit 1
+    fi
+
+    echo "${RESP}" | sed 's/.*"token":"\([^"]*\)".*/\1/' > /var/run/secrets/enriched/token
+    chmod 0600 /var/run/secrets/enriched/token
+    echo "Enriched OIDC token obtained."

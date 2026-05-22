@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oidc-broker
+  namespace: oidc-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oidc-broker
+  template:
+    metadata:
+      labels:
+        app: oidc-broker
+    spec:
+      serviceAccountName: oidc-broker
+      containers:
+        - name: broker
+          image: oidc-broker:test
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            - name: ISSUER_URL
+              value: "https://test-issuer.example.com"
+            - name: SIGNING_KEY_PATH
+              value: /etc/oidc-broker/signing-key.pem
+            - name: ALLOWED_AUDIENCES
+              value: "sts.amazonaws.com"
+          volumeMounts:
+            - name: signing-key
+              mountPath: /etc/oidc-broker
+              readOnly: true
+      volumes:
+        - name: signing-key
+          secret:
+            secretName: oidc-signing-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oidc-broker
+  namespace: oidc-broker
+spec:
+  selector:
+    app: oidc-broker
+  ports:
+    - port: 80
+      targetPort: 8080

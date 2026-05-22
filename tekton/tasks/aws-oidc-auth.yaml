@@ -1,0 +1,85 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: aws-oidc-auth
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: "aws, oidc, authentication"
+spec:
+  description: |-
+    Authenticates to AWS using OIDC workload identity federation via
+    the Konflux OIDC Broker. No static AWS credentials required.
+
+    Uses oidc-broker-auth to obtain an enriched JWT, then aws-oidc-auth
+    to exchange it for temporary AWS credentials. Credentials are written
+    to an in-memory volume and never exposed via Task results or logs.
+  params:
+    - name: roleArn
+      description: ARN of the IAM role to assume.
+    - name: region
+      description: AWS region for STS endpoint.
+      default: us-east-1
+    - name: sessionDuration
+      description: Duration in seconds for temporary credentials (900-43200).
+      default: "900"
+    - name: brokerUrl
+      description: URL of the Konflux OIDC Broker service.
+      default: http://oidc-broker.oidc-broker.svc/v1
+    - name: image
+      description: Container image for the run step.
+      default: registry.access.redhat.com/ubi9-minimal:latest
+    - name: script
+      description: |-
+        Script to execute with AWS credentials available.
+        AWS_SHARED_CREDENTIALS_FILE and AWS_DEFAULT_REGION are pre-configured.
+      default: "echo 'AWS credentials available. Override this param with your script.'"
+  volumes:
+    - name: broker-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: konflux-oidc-broker
+              expirationSeconds: 600
+              path: token
+    - name: enriched-token
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Ki
+    - name: aws-credentials
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Mi
+  steps:
+    - name: broker-auth
+      ref:
+        name: oidc-broker-auth
+      params:
+        - name: brokerUrl
+          value: $(params.brokerUrl)
+    - name: aws-auth
+      ref:
+        name: aws-oidc-auth
+      params:
+        - name: roleArn
+          value: $(params.roleArn)
+        - name: region
+          value: $(params.region)
+        - name: sessionDuration
+          value: $(params.sessionDuration)
+    - name: run
+      image: $(params.image)
+      volumeMounts:
+        - name: aws-credentials
+          mountPath: /var/run/secrets/aws
+          readOnly: true
+      env:
+        - name: AWS_SHARED_CREDENTIALS_FILE
+          value: /var/run/secrets/aws/credentials
+        - name: AWS_DEFAULT_REGION
+          value: $(params.region)
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        # shellcheck disable=SC2091
+        $(params.script)

@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: rogue-pod
+  namespace: default
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: token
+      projected:
+        sources:
+          - serviceAccountToken:
+              audience: konflux-oidc-broker
+              expirationSeconds: 600
+              path: token
+  containers:
+    - name: rogue
+      image: registry.access.redhat.com/ubi9-minimal:latest
+      volumeMounts:
+        - name: token
+          mountPath: /var/run/secrets/broker
+          readOnly: true
+      command:
+        - bash
+        - -c
+        - |
+          set +x
+          SA_TOKEN=$(cat /var/run/secrets/broker/token)
+          RESP=$(curl -s -X POST http://oidc-broker.oidc-broker.svc/v1/token \
+            -H "Content-Type: application/json" \
+            -d "{\"sa_token\": \"${SA_TOKEN}\"}")
+          if echo "$RESP" | grep -q '"error"'; then
+            echo "REJECTED"
+          else
+            echo "SHOULD_HAVE_BEEN_REJECTED"
+            exit 1
+          fi

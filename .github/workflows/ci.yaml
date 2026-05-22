@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run unit tests
+        run: go test -v -race -count=1 ./...
+
+      - name: Run fuzz tests
+        run: |
+          grep -r "^func Fuzz" --include="*_test.go" -l | while read file; do
+            pkg=$(dirname "$file")
+            grep -o "^func Fuzz[A-Za-z0-9_]*" "$file" | sed 's/^func //' | while read func; do
+              echo "=== Fuzzing $func in $pkg ==="
+              go test -fuzz="^${func}$" -fuzztime=15s "./${pkg}"
+            done
+          done
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binary
+        run: CGO_ENABLED=0 go build -o oidc-broker .
+
+      - name: Build container
+        run: docker build -f Containerfile -t oidc-broker:test .
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: test
+
+      - name: Install Tekton
+        run: |
+          kubectl apply --filename https://storage.googleapis.com/tekton-releases/pipeline/latest/release.yaml
+          kubectl wait --for=condition=ready pod -l app=tekton-pipelines-controller -n tekton-pipelines --timeout=120s
+          kubectl wait --for=condition=ready pod -l app=tekton-pipelines-webhook -n tekton-pipelines --timeout=120s
+
+      - name: Build and load image
+        run: |
+          openssl genrsa -out signing-key.pem 2048
+          CGO_ENABLED=0 go build -o oidc-broker .
+          docker build -f Containerfile -t oidc-broker:test .
+          kind load docker-image oidc-broker:test --name test
+
+      - name: Deploy broker
+        run: |
+          kubectl create namespace oidc-broker
+          kubectl create serviceaccount oidc-broker -n oidc-broker
+          kubectl create clusterrolebinding oidc-broker-tokenreview \
+            --clusterrole=system:auth-delegator \
+            --serviceaccount=oidc-broker:oidc-broker
+          kubectl create clusterrole oidc-broker-reader \
+            --verb=get --resource=pods,taskruns.tekton.dev,pipelineruns.tekton.dev
+          kubectl create clusterrolebinding oidc-broker-reader \
+            --clusterrole=oidc-broker-reader \
+            --serviceaccount=oidc-broker:oidc-broker
+          kubectl create secret generic oidc-signing-key \
+            -n oidc-broker --from-file=signing-key.pem=signing-key.pem
+          kubectl apply -f test/manifests/broker-deployment.yaml
+          kubectl wait --for=condition=ready pod -l app=oidc-broker -n oidc-broker --timeout=60s
+
+      - name: Integration test - token enrichment
+        run: |
+          kubectl create -f test/manifests/test-pipelinerun.yaml
+          sleep 10
+          PR_NAME=$(kubectl get pipelinerun -o jsonpath='{.items[-1].metadata.name}')
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get pipelinerun "$PR_NAME" -o jsonpath='{.status.conditions[0].status}' 2>/dev/null || echo "Unknown")
+            if [ "$STATUS" != "Unknown" ]; then break; fi
+            sleep 5
+          done
+          REASON=$(kubectl get pipelinerun "$PR_NAME" -o jsonpath='{.status.conditions[0].reason}')
+          if [ "$REASON" != "Succeeded" ]; then
+            echo "PipelineRun failed: $REASON"
+            echo "=== PipelineRun condition message ==="
+            kubectl get pipelinerun "$PR_NAME" -o jsonpath='{.status.conditions[0].message}' || true
+            echo ""
+            echo "=== TaskRun status ==="
+            TR=$(kubectl get pipelinerun "$PR_NAME" -o jsonpath='{.status.childReferences[0].name}' 2>/dev/null || true)
+            if [ -n "$TR" ]; then
+              kubectl get taskrun "$TR" -o jsonpath='{.status.conditions[0].message}' || true
+              echo ""
+              echo "=== Step logs ==="
+              kubectl logs "${TR}-pod" -c step-test 2>&1 || kubectl logs "${TR}-pod" --all-containers 2>&1 || true
+              echo "=== Pod status ==="
+              kubectl get pod "${TR}-pod" -o jsonpath='{.status.containerStatuses[*].state}' 2>&1 || true
+            fi
+            echo ""
+            echo "=== Broker logs ==="
+            kubectl logs -n oidc-broker -l app=oidc-broker --tail=20 2>&1 || true
+            exit 1
+          fi
+          echo "Integration test passed"
+
+      - name: Integration test - non-Tekton pod rejected
+        run: |
+          kubectl apply -f test/manifests/test-rogue-pod.yaml
+          kubectl wait --for=condition=ready pod/rogue-pod --timeout=30s 2>/dev/null || true
+          sleep 15
+          RESULT=$(kubectl logs rogue-pod 2>&1 | tail -1)
+          kubectl delete pod rogue-pod --ignore-not-found
+          if [ "$RESULT" = "REJECTED" ]; then
+            echo "Non-Tekton pod correctly rejected"
+          else
+            echo "FAIL: Non-Tekton pod was not rejected. Got: $RESULT"
+            exit 1
+          fi
