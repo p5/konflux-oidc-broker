@@ -1,0 +1,54 @@
+---
+apiVersion: tekton.dev/v1alpha1
+kind: StepAction
+metadata:
+  name: vault-oidc-auth
+spec:
+  description: |-
+    Exchanges an enriched OIDC token for a Vault token via
+    JWT/OIDC auth method. Must run after oidc-broker-auth.
+  image: hashicorp/vault:latest
+  params:
+    - name: vaultAddr
+      type: string
+      description: Vault server URL.
+    - name: role
+      type: string
+      description: Vault JWT auth role name.
+    - name: authPath
+      type: string
+      default: jwt
+      description: Vault auth mount path.
+    - name: enrichedTokenVolume
+      type: string
+      default: enriched-token
+      description: Name of the volume containing the enriched JWT.
+    - name: vaultCredentialsVolume
+      type: string
+      default: vault-credentials
+      description: Name of the emptyDir volume for writing the Vault token.
+  env:
+    - name: VAULT_ADDR
+      value: "$(params.vaultAddr)"
+    - name: AUTH_PATH
+      value: "$(params.authPath)"
+    - name: ROLE
+      value: "$(params.role)"
+  volumeMounts:
+    - name: $(params.enrichedTokenVolume)
+      mountPath: /var/run/secrets/enriched
+      readOnly: true
+    - name: $(params.vaultCredentialsVolume)
+      mountPath: /var/run/secrets/vault
+  script: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set +x
+
+    VAULT_TOKEN=$(vault write -field=token "auth/${AUTH_PATH}/login" \
+      role="${ROLE}" \
+      jwt="$(cat /var/run/secrets/enriched/token)")
+
+    echo -n "${VAULT_TOKEN}" > /var/run/secrets/vault/token
+    chmod 0600 /var/run/secrets/vault/token
+    echo "Vault token obtained."

@@ -1,0 +1,51 @@
+---
+apiVersion: tekton.dev/v1alpha1
+kind: StepAction
+metadata:
+  name: azure-oidc-auth
+spec:
+  description: |-
+    Exchanges an enriched OIDC token for Azure credentials via
+    Federated Identity Credentials. Must run after oidc-broker-auth.
+  image: mcr.microsoft.com/azure-cli:latest
+  params:
+    - name: clientId
+      type: string
+      description: Azure AD application (client) ID.
+    - name: tenantId
+      type: string
+      description: Azure AD tenant ID.
+    - name: enrichedTokenVolume
+      type: string
+      default: enriched-token
+      description: Name of the volume containing the enriched JWT.
+    - name: azureCredentialsVolume
+      type: string
+      default: azure-credentials
+      description: Name of the emptyDir volume for writing credentials.
+  env:
+    - name: AZURE_CLIENT_ID
+      value: "$(params.clientId)"
+    - name: AZURE_TENANT_ID
+      value: "$(params.tenantId)"
+  volumeMounts:
+    - name: $(params.enrichedTokenVolume)
+      mountPath: /var/run/secrets/enriched
+      readOnly: true
+    - name: $(params.azureCredentialsVolume)
+      mountPath: /var/run/secrets/azure
+  script: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set +x
+
+    az login --service-principal \
+      -u "${AZURE_CLIENT_ID}" \
+      -t "${AZURE_TENANT_ID}" \
+      --federated-token "$(cat /var/run/secrets/enriched/token)" \
+      --output none
+
+    # Write subscription info for downstream steps
+    az account show > /var/run/secrets/azure/account.json
+    chmod 0600 /var/run/secrets/azure/account.json
+    echo "Azure credentials obtained."

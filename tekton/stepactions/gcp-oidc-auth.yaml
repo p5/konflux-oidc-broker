@@ -1,0 +1,71 @@
+---
+apiVersion: tekton.dev/v1alpha1
+kind: StepAction
+metadata:
+  name: gcp-oidc-auth
+spec:
+  description: |-
+    Exchanges an enriched OIDC token for GCP credentials via
+    Workload Identity Federation. Must run after oidc-broker-auth.
+  image: google/cloud-sdk:slim
+  params:
+    - name: projectNumber
+      type: string
+      description: GCP project number.
+    - name: pool
+      type: string
+      description: Workload Identity Pool ID.
+    - name: provider
+      type: string
+      description: Workload Identity Pool Provider ID.
+    - name: serviceAccount
+      type: string
+      description: GCP service account email to impersonate.
+    - name: enrichedTokenVolume
+      type: string
+      default: enriched-token
+      description: Name of the volume containing the enriched JWT.
+    - name: gcpCredentialsVolume
+      type: string
+      default: gcp-credentials
+      description: Name of the emptyDir volume for writing credentials.
+  env:
+    - name: PROJECT_NUMBER
+      value: "$(params.projectNumber)"
+    - name: POOL
+      value: "$(params.pool)"
+    - name: PROVIDER
+      value: "$(params.provider)"
+    - name: SERVICE_ACCOUNT
+      value: "$(params.serviceAccount)"
+  volumeMounts:
+    - name: $(params.enrichedTokenVolume)
+      mountPath: /var/run/secrets/enriched
+      readOnly: true
+    - name: $(params.gcpCredentialsVolume)
+      mountPath: /var/run/secrets/gcp
+  script: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set +x
+
+    CRED_FILE="/var/run/secrets/gcp/application_default_credentials.json"
+    AUDIENCE="//iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL}/providers/${PROVIDER}"
+
+    cat > "${CRED_FILE}" <<CRED
+    {
+      "type": "external_account",
+      "audience": "${AUDIENCE}",
+      "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+      "token_url": "https://sts.googleapis.com/v1/token",
+      "credential_source": {
+        "file": "/var/run/secrets/enriched/token"
+      },
+      "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${SERVICE_ACCOUNT}:generateAccessToken"
+    }
+    CRED
+
+    chmod 0600 "${CRED_FILE}"
+    export GOOGLE_APPLICATION_CREDENTIALS="${CRED_FILE}"
+    gcloud auth login --cred-file="${CRED_FILE}" --quiet
+    echo "GCP credentials obtained."

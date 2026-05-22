@@ -2,7 +2,7 @@
 title: "67. Workload Identity Federation for Pipeline Cloud Access"
 status: Proposed
 applies_to:
-  - pipeline-service
+  - "*"
 topics:
   - security
   - authentication
@@ -134,12 +134,15 @@ If the broker proves valuable, integrate it directly into the pipeline-service d
 
 ### Tekton Integration
 
-Two Tekton resources are provided:
+A cloud-agnostic StepAction obtains the enriched JWT, and provider-specific StepActions handle credential exchange:
 
-- **`oidc-broker-auth` StepAction** — cloud-agnostic; obtains enriched JWT from the broker
-- **`aws-oidc-auth` StepAction** — AWS-specific; exchanges enriched JWT for temporary STS credentials
+- **`oidc-broker-auth`** — calls the broker, writes enriched JWT to in-memory volume
+- **`aws-oidc-auth`** — exchanges JWT for temporary AWS STS credentials
+- **`gcp-oidc-auth`** — exchanges JWT for GCP credentials via Workload Identity Federation
+- **`azure-oidc-auth`** — exchanges JWT for Azure credentials via Federated Identity Credentials
+- **`vault-oidc-auth`** — exchanges JWT for a Vault token via JWT auth method
 
-A wrapper **`aws-oidc-auth` Task** combines both StepActions with a user-supplied script for simple use cases.
+A wrapper **`aws-oidc-auth` Task** combines broker auth and AWS exchange with a user-supplied script for simple use cases. Similar wrapper Tasks can be created for other providers.
 
 ### User Experience
 
